@@ -1,0 +1,10 @@
+[package]
+name = "voxel-vulkano"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+vulkano = "0.35.1"
+vulkano-shaders = "0.35"
+winit = "0.30.11"
+image = "0.25.6"
