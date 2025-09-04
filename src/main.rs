@@ -168,7 +168,7 @@ impl App {
             shader::ShaderModuleCreateInfo::new(spirv_bin.as_binary()),
         ).expect("failed to create shader module")};
 
-        let cs = shader_module.entry_point("main").unwrap();
+        let cs = shader_module.entry_point("main").unwrap(); // need to look into this further. probably doing something wrong.
         let stage = PipelineShaderStageCreateInfo::new(cs);
         let layout = PipelineLayout::new(
             self.device.as_ref().unwrap().clone(),
