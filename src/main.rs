@@ -1,46 +1,144 @@
-use vulkano::{shader, VulkanLibrary};
-use vulkano::instance::{Instance, InstanceCreateFlags, InstanceCreateInfo};
-use vulkano::device::{Device, DeviceCreateInfo, QueueCreateInfo, QueueFlags, Queue, DeviceExtensions};
-use vulkano::device::physical::{PhysicalDevice, PhysicalDeviceType};
-use vulkano::swapchain::Surface;
-use vulkano::swapchain::{Swapchain, SwapchainCreateInfo, SwapchainPresentInfo};
+use vulkano::{
+    shader, 
+    VulkanLibrary
+};
+use vulkano::instance::{
+    Instance, 
+    InstanceCreateFlags, 
+    InstanceCreateInfo
+};
+use vulkano::device::{
+    Device, 
+    DeviceCreateInfo, 
+    QueueCreateInfo, 
+    QueueFlags, 
+    Queue, 
+    DeviceExtensions,
+    physical::{PhysicalDevice, PhysicalDeviceType}
+};
+use vulkano::swapchain::{
+    Surface, 
+    Swapchain, 
+    SwapchainCreateInfo, 
+    SwapchainPresentInfo
+};
 
-use vulkano::memory::allocator::{StandardMemoryAllocator, AllocationCreateInfo, MemoryTypeFilter};
-//use vulkano::buffer::{Buffer, BufferCreateInfo, BufferUsage, BufferContents};
-
+use vulkano::memory::allocator::{
+    StandardMemoryAllocator, 
+    AllocationCreateInfo, 
+    MemoryTypeFilter
+};
+use vulkano::buffer::{
+    Buffer, 
+    BufferCreateInfo, 
+    BufferUsage, 
+    BufferContents
+};
 use vulkano::format::Format;
-use vulkano::image::view::ImageView;
-use vulkano::image::{Image, ImageCreateInfo, ImageType, ImageUsage};
-
-use vulkano::command_buffer::{AutoCommandBufferBuilder, CommandBufferUsage};
-//use vulkano::command_buffer::CopyImageToBufferInfo;
-use vulkano::command_buffer::allocator::StandardCommandBufferAllocator;
-use vulkano::command_buffer::allocator::CommandBufferAllocator;
-use vulkano::command_buffer::BlitImageInfo;
-
-use vulkano::pipeline::compute::ComputePipelineCreateInfo;
-use vulkano::pipeline::layout::PipelineDescriptorSetLayoutCreateInfo;
-use vulkano::pipeline::{ComputePipeline, PipelineLayout, PipelineShaderStageCreateInfo};
-use vulkano::pipeline::PipelineBindPoint;
-use vulkano::pipeline::Pipeline;
-
-use vulkano::descriptor_set::{DescriptorSet, WriteDescriptorSet};
-use vulkano::descriptor_set::allocator::StandardDescriptorSetAllocator;
-
+use vulkano::image::{
+    Image, 
+    ImageCreateInfo, 
+    ImageType, 
+    ImageUsage,
+    view::ImageView
+};
+use vulkano::command_buffer::{
+    //CopyImageToBufferInfo,
+    AutoCommandBufferBuilder, 
+    CommandBufferUsage,
+    allocator::StandardCommandBufferAllocator,
+    allocator::CommandBufferAllocator,
+    BlitImageInfo
+};
+use vulkano::pipeline::{
+    compute::ComputePipelineCreateInfo,
+    layout::PipelineDescriptorSetLayoutCreateInfo,
+    ComputePipeline,
+    Pipeline,
+    PipelineLayout, 
+    PipelineShaderStageCreateInfo,
+    PipelineBindPoint
+};
+use vulkano::descriptor_set::{
+    DescriptorSet, 
+    WriteDescriptorSet,
+    allocator::StandardDescriptorSetAllocator
+};
 use vulkano::sync::GpuFuture;
-
-use std::fs;
-use std::time::{SystemTime, Duration};
-use std::sync::{Arc};
-
 use winit::{
-    event::{WindowEvent},
+    event::{WindowEvent, DeviceEvent},
     event_loop::{ActiveEventLoop, ControlFlow, EventLoop},
     window::{Window, WindowId},
     application::ApplicationHandler,
 };
-
+use std::{
+    fs,
+    time::SystemTime,
+    sync::Arc
+};
 use shaderc;
+use nalgebra as na;
+use na::{
+    Isometry3, 
+    Matrix4, 
+    Point3, 
+    UnitQuaternion, 
+    Vector3,
+    Perspective3
+};
+
+struct Camera {
+    isom: Isometry3<f32>,
+    fov: f32, // deg
+    near: f32,
+    far: f32,
+    yaw: f32, // deg
+    pitch: f32, // deg
+    mouse_sens: f32,
+    first_mouse: bool
+}
+
+impl Default for Camera {
+    fn default() -> Self {
+        Self { 
+            isom: Isometry3::identity(), 
+            fov: 90.0, 
+            near: 0.1, 
+            far: 100.0, 
+            yaw: -90.0, 
+            pitch: 0.0, 
+            mouse_sens: 0.1,
+            first_mouse: true
+        }
+    }
+}
+
+impl Camera {
+    fn get_view(&self) -> Matrix4<f32> {
+        self.isom.inverse().to_homogeneous()
+    }
+    fn get_proj(&self, width: u32, height: u32) -> Matrix4<f32> {
+        Perspective3::new(
+            width as f32 / height as f32,
+            self.fov.to_radians(),
+            self.near,
+            self.far
+        ).to_homogeneous()
+    }
+    fn update_isometry(&mut self) {
+        let yaw = self.yaw.to_radians();
+        let pitch = self.pitch.to_radians();
+        let rotation = UnitQuaternion::from_axis_angle(&Vector3::y_axis(), yaw)
+            * UnitQuaternion::from_axis_angle(&Vector3::x_axis(), pitch);
+        self.isom.rotation = rotation
+    }
+    fn update_orientation(&mut self, dx: f32, dy: f32) {
+        self.yaw += dx * self.mouse_sens;
+        self.pitch += dy * self.mouse_sens;
+        self.pitch = self.pitch.clamp(-89.9,89.9);
+        self.update_isometry();
+    }
+}
 
 struct App {
     window: Option<Arc<Window>>,
@@ -58,6 +156,7 @@ struct App {
     compute_shader_last_modified: SystemTime,
     width: u32,
     height: u32,
+    camera: Camera
 }
 
 impl Default for App {
@@ -78,6 +177,7 @@ impl Default for App {
             compute_shader_last_modified: SystemTime::UNIX_EPOCH,
             width: 1024,
             height: 768,
+            camera: Camera::default()
         }
     }
 }
@@ -148,16 +248,17 @@ impl App {
         self.swapchain_images = images;
     }
 
-    fn update_compute_pipeline_shaderc(&mut self) {
+    fn update_compute_pipeline_shaderc(&mut self) { // needs to be rewritten to handle errors properly without expects
         let source = fs::read_to_string(self.compute_shader_path.clone()).expect("failed to read shader file");
+        let entry_point_name = "main";
 
         let shaderc_compiler = shaderc::Compiler::new().unwrap();
-        //let mut options
+        
         let spirv_bin = shaderc_compiler.compile_into_spirv(
             &source,
             shaderc::ShaderKind::Compute,
             &self.compute_shader_path,
-            "main",
+            entry_point_name,
             None,
         ).expect("failed to compile glsl shader into spirv");
         
@@ -168,8 +269,8 @@ impl App {
             shader::ShaderModuleCreateInfo::new(spirv_bin.as_binary()),
         ).expect("failed to create shader module")};
 
-        let cs = shader_module.entry_point("main").unwrap(); // need to look into this further. probably doing something wrong.
-        let stage = PipelineShaderStageCreateInfo::new(cs);
+        let shader_entry_point = shader_module.entry_point(entry_point_name).unwrap(); // need to look into this further. probably doing something wrong.
+        let stage = PipelineShaderStageCreateInfo::new(shader_entry_point);
         let layout = PipelineLayout::new(
             self.device.as_ref().unwrap().clone(),
             PipelineDescriptorSetLayoutCreateInfo::from_stages([&stage])
@@ -363,7 +464,7 @@ impl ApplicationHandler for App {
         println!("Device: {}", self.device.as_ref().unwrap().physical_device().properties().device_name);
     }
 
-    fn window_event(&mut self, event_loop: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
+    fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         match event {
             WindowEvent::CloseRequested => {
                 println!("close requested. stopping.");
@@ -389,9 +490,24 @@ impl ApplicationHandler for App {
                     self.compute_shader_last_modified = compute_shader_modified;
                 }
 
+                let view_mat = self.camera.get_view();
+                let proj_mat = self.camera.get_proj(self.width, self.height);
+
                 self.update_frame();
                 self.window.as_ref().unwrap().request_redraw();
-            }
+            },
+            WindowEvent::KeyboardInput { device_id, event, is_synthetic } => {
+
+            },
+            _ => (),
+        }
+    }
+
+    fn device_event(&mut self, event_loop: &ActiveEventLoop, _id: winit::event::DeviceId, event: DeviceEvent) {
+        match event {
+            DeviceEvent::MouseMotion{delta: (dx, dy)} => {
+                self.camera.update_orientation(dx as f32, dy as f32);
+            },
             _ => (),
         }
     }
