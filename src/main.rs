@@ -29,10 +29,11 @@ use vulkano::memory::allocator::{
     MemoryTypeFilter
 };
 use vulkano::buffer::{
-    Buffer, 
-    BufferCreateInfo, 
+    //Buffer, 
+    //BufferCreateInfo, 
     BufferUsage, 
-    BufferContents
+    BufferContents,
+    allocator::{SubbufferAllocator, SubbufferAllocatorCreateInfo}
 };
 use vulkano::format::Format;
 use vulkano::image::{
@@ -66,10 +67,11 @@ use vulkano::descriptor_set::{
 };
 use vulkano::sync::GpuFuture;
 use winit::{
-    event::{WindowEvent, DeviceEvent},
+    event::{WindowEvent, DeviceEvent, ElementState},
     event_loop::{ActiveEventLoop, ControlFlow, EventLoop},
     window::{Window, WindowId},
     application::ApplicationHandler,
+    keyboard::{PhysicalKey, KeyCode},
 };
 use std::{
     fs,
@@ -81,7 +83,7 @@ use nalgebra as na;
 use na::{
     Isometry3, 
     Matrix4, 
-    Point3, 
+    //Point3, 
     UnitQuaternion, 
     Vector3,
     Perspective3
@@ -95,6 +97,7 @@ struct Camera {
     yaw: f32, // deg
     pitch: f32, // deg
     mouse_sens: f32,
+    speed: f32,
     first_mouse: bool
 }
 
@@ -108,6 +111,7 @@ impl Default for Camera {
             yaw: -90.0, 
             pitch: 0.0, 
             mouse_sens: 0.1,
+            speed: 200.0,
             first_mouse: true
         }
     }
@@ -152,11 +156,17 @@ struct App {
     compute_pipeline: Option<Arc<ComputePipeline>>,
     computed_image: Option<Arc<Image>>,
     computed_image_view: Option<Arc<ImageView>>,
+    descriptor_set_allocator: Option<Arc<StandardDescriptorSetAllocator>>,
+    uniform_allocator: Option<SubbufferAllocator>,
     compute_shader_path: String,
     compute_shader_last_modified: SystemTime,
     width: u32,
     height: u32,
-    camera: Camera
+    camera: Camera,
+    instant: std::time::Instant,
+    time: f32,
+    last_time: f32,
+    dt: f32
 }
 
 impl Default for App {
@@ -173,11 +183,17 @@ impl Default for App {
             compute_pipeline: None,
             computed_image: None,
             computed_image_view: None,
-            compute_shader_path: "src/shaders/compute.comp".to_string(),
+            descriptor_set_allocator: None,
+            uniform_allocator: None,
+            compute_shader_path: "src/shaders/crude_vox_test.comp".to_string(),
             compute_shader_last_modified: SystemTime::UNIX_EPOCH,
             width: 1024,
             height: 768,
-            camera: Camera::default()
+            camera: Camera::default(),
+            instant: std::time::Instant::now(),
+            time: 0.0,
+            last_time: 0.0,
+            dt: 0.0
         }
     }
 }
@@ -253,13 +269,15 @@ impl App {
         let entry_point_name = "main";
 
         let shaderc_compiler = shaderc::Compiler::new().unwrap();
-        
+        let mut options = shaderc::CompileOptions::new().unwrap();
+        options.set_target_env(shaderc::TargetEnv::Vulkan, shaderc::EnvVersion::Vulkan1_3 as u32);
+        options.set_forced_version_profile(460 as u32, shaderc::GlslProfile::Core);
         let spirv_bin = shaderc_compiler.compile_into_spirv(
             &source,
             shaderc::ShaderKind::Compute,
             &self.compute_shader_path,
             entry_point_name,
-            None,
+            Some(&options),
         ).expect("failed to compile glsl shader into spirv");
         
         assert_eq!(Some(&0x07230203), spirv_bin.as_binary().first());
@@ -288,7 +306,7 @@ impl App {
         self.compute_pipeline = Some(compute_pipeline);
     }
 
-    fn update_compute_pipeline_vulkano(&mut self) {
+    /*fn update_compute_pipeline_vulkano(&mut self) {
         mod cs {
             vulkano_shaders::shader!{
                 ty: "compute",
@@ -314,7 +332,7 @@ impl App {
         .expect("failed to create compute pipeline");
 
         self.compute_pipeline = Some(compute_pipeline);
-    }
+    }*/
 
     fn update_frame(&mut self) {
         let computed_image = self.computed_image.get_or_insert_with(|| {
@@ -337,21 +355,50 @@ impl App {
         let computed_image_view = self.computed_image_view.get_or_insert_with(|| {
             ImageView::new_default(computed_image.clone()).unwrap()
         });
-        
-        let descriptor_set_allocator = Arc::new(StandardDescriptorSetAllocator::new(
+
+        // camera mats
+        let view_mat = self.camera.get_view();
+        let proj_mat = self.camera.get_proj(self.width, self.height);
+
+        #[repr(C)]
+        #[derive(Copy, Clone, Default, BufferContents)]
+        struct CameraMats {
+            view: [[f32; 4]; 4],
+            proj: [[f32; 4]; 4],
+            _padding: [f32; 8],
+        }
+
+        let uniform_contents = CameraMats{
+            view: view_mat.clone().into(),
+            proj: proj_mat.clone().into(),
+            _padding: [0.0; 8],
+        };
+
+        self.uniform_allocator = Some(SubbufferAllocator::new(
+            self.memory_allocator.as_ref().unwrap().clone(),
+            SubbufferAllocatorCreateInfo {
+                buffer_usage: BufferUsage::UNIFORM_BUFFER,
+                memory_type_filter: MemoryTypeFilter::PREFER_HOST | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+                ..Default::default()
+            },
+        ));
+
+        let uniform_subbuffer = self.uniform_allocator.as_ref().unwrap().allocate_sized().unwrap();
+        *uniform_subbuffer.write().unwrap() = uniform_contents.clone();
+
+        self.descriptor_set_allocator = Some(Arc::new(StandardDescriptorSetAllocator::new(
             self.device.as_ref().unwrap().clone(),
             Default::default(),
-        ));
+        )));
         let pipeline_layout = self.compute_pipeline.as_ref().unwrap().layout();
-        let descriptor_set_layouts = pipeline_layout.set_layouts();
-        let descriptor_set_layout_index = 0;
-        let descriptor_set_layout = descriptor_set_layouts
-            .get(descriptor_set_layout_index)
-            .unwrap();
+        let descriptor_set_layout = pipeline_layout.set_layouts().get(0).unwrap();
         let descriptor_set = DescriptorSet::new(
-            descriptor_set_allocator,
+            self.descriptor_set_allocator.as_ref().unwrap().clone(),
             descriptor_set_layout.clone(),
-            [WriteDescriptorSet::image_view(0, computed_image_view.clone())], // binding 0
+            [
+                WriteDescriptorSet::image_view(0, computed_image_view.clone()),
+                WriteDescriptorSet::buffer(1, uniform_subbuffer.clone()),
+            ],
             [],
         ).unwrap();
 
@@ -373,7 +420,7 @@ impl App {
             .bind_descriptor_sets(
                 PipelineBindPoint::Compute,
                 self.compute_pipeline.as_ref().unwrap().layout().clone(),
-                descriptor_set_layout_index as u32,
+                0,
                 descriptor_set,
             )
             .unwrap()
@@ -391,7 +438,6 @@ impl App {
             .unwrap();
         future.wait(None).unwrap();
     }
-
 }
 
 impl ApplicationHandler for App {
@@ -479,10 +525,14 @@ impl ApplicationHandler for App {
                     self.computed_image_view = None;
 
                     self.update_swapchain();
-                    println!("window resized to {}x{}",self.width,self.height);
+                    //println!("window resized to {}x{}",self.width,self.height);
                 }
             },
             WindowEvent::RedrawRequested => {
+                self.time = self.instant.elapsed().as_secs_f32();
+                self.dt = self.time - self.last_time;
+                self.last_time = self.time;
+
                 let compute_shader_modified = fs::metadata(&self.compute_shader_path).unwrap().modified().unwrap();
                 if compute_shader_modified > self.compute_shader_last_modified {
                     //self.update_compute_pipeline_vulkano();
@@ -490,14 +540,26 @@ impl ApplicationHandler for App {
                     self.compute_shader_last_modified = compute_shader_modified;
                 }
 
-                let view_mat = self.camera.get_view();
-                let proj_mat = self.camera.get_proj(self.width, self.height);
-
                 self.update_frame();
                 self.window.as_ref().unwrap().request_redraw();
             },
-            WindowEvent::KeyboardInput { device_id, event, is_synthetic } => {
-
+            WindowEvent::KeyboardInput{device_id, event, is_synthetic: false} => {
+                if event.state.is_pressed() {
+                    match event.physical_key {
+                        PhysicalKey::Code(KeyCode::KeyW) => self.camera.isom.translation.vector +=
+                            (self.camera.isom.rotation * Vector3::z_axis()).into_inner() * self.camera.speed * self.dt,        
+                        PhysicalKey::Code(KeyCode::KeyS) => self.camera.isom.translation.vector -=
+                            (self.camera.isom.rotation * Vector3::z_axis()).into_inner() * self.camera.speed * self.dt,
+                        PhysicalKey::Code(KeyCode::KeyA) => self.camera.isom.translation.vector -=
+                            (self.camera.isom.rotation * Vector3::x_axis()).into_inner() * self.camera.speed * self.dt,
+                        PhysicalKey::Code(KeyCode::KeyD) => self.camera.isom.translation.vector +=
+                            (self.camera.isom.rotation * Vector3::x_axis()).into_inner() * self.camera.speed * self.dt,
+                        PhysicalKey::Code(KeyCode::Space) => self.camera.isom.translation.vector.y += self.camera.speed * self.dt,
+                        PhysicalKey::Code(KeyCode::ShiftLeft) => self.camera.isom.translation.vector.y -= self.camera.speed * self.dt,
+                        _ => (),
+                    }
+                }
+                
             },
             _ => (),
         }
