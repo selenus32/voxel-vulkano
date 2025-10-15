@@ -2,8 +2,9 @@ use winit::{
     event_loop::{ControlFlow, EventLoop},
 };
 
+mod player;
+mod voxels;
 mod app;
-mod camera;
 
 use crate::app::App;
 

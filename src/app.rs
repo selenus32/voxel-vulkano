@@ -1,3 +1,4 @@
+use vulkano::command_buffer::PrimaryCommandBufferAbstract;
 use vulkano::{
     shader, 
     VulkanLibrary
@@ -22,15 +23,15 @@ use vulkano::swapchain::{
     SwapchainCreateInfo, 
     SwapchainPresentInfo
 };
-
 use vulkano::memory::allocator::{
     StandardMemoryAllocator, 
     AllocationCreateInfo, 
     MemoryTypeFilter
 };
 use vulkano::buffer::{
-    //Buffer, 
-    //BufferCreateInfo, 
+    Buffer,
+    Subbuffer, 
+    BufferCreateInfo, 
     BufferUsage, 
     BufferContents,
     allocator::{SubbufferAllocator, SubbufferAllocatorCreateInfo}
@@ -67,8 +68,8 @@ use vulkano::descriptor_set::{
 };
 use vulkano::sync::GpuFuture;
 use winit::{
-    event::{WindowEvent, DeviceEvent, ElementState},
-    event_loop::{ActiveEventLoop, ControlFlow, EventLoop},
+    event::{WindowEvent, DeviceEvent, ElementState, MouseButton},
+    event_loop::{ActiveEventLoop},
     window::{Window, WindowId},
     application::ApplicationHandler,
     keyboard::{PhysicalKey, KeyCode},
@@ -78,18 +79,23 @@ use std::{
     time::SystemTime,
     sync::Arc
 };
+use std::collections::HashSet;
 use shaderc;
-
 use nalgebra as na;
 use na::{
-    Isometry3, 
-    Matrix4,
-    UnitQuaternion, 
     Vector3,
-    Perspective3
 };
 
-use crate::camera::Camera;
+use crate::player::Player;
+
+use crate::voxels::brickmap::*;
+use crate::voxels::tree64;
+
+#[derive(Hash, Eq, PartialEq, Debug)]
+enum InputButton {
+    Key(KeyCode),
+    Mouse(MouseButton),
+}
 
 pub struct App {
     window: Option<Arc<Window>>,
@@ -109,11 +115,16 @@ pub struct App {
     compute_shader_last_modified: SystemTime,
     width: u32,
     height: u32,
-    camera: Camera,
+    player: Player,
+    device_local_buffer: Option<Subbuffer<[u32]>>,
+    brickmap_data_size: u32,
+    pressed: HashSet<InputButton>,
     instant: std::time::Instant,
     time: f32,
     last_time: f32,
-    dt: f32
+    dt: f32,
+    fps_accum: u32,
+    fps_time_accum: f32
 }
 
 impl Default for App {
@@ -132,15 +143,20 @@ impl Default for App {
             computed_image_view: None,
             descriptor_set_allocator: None,
             uniform_allocator: None,
-            compute_shader_path: "src/shaders/crude_vox_test.comp".to_string(),
+            compute_shader_path: "src/shaders/crude_vox_test.comp.glsl".to_string(),
             compute_shader_last_modified: SystemTime::UNIX_EPOCH,
             width: 1024,
-            height: 768,
-            camera: Camera::default(),
+            height: 1024,
+            player: Player::default(),
+            device_local_buffer: None,
+            brickmap_data_size: 0,
+            pressed: HashSet::new(),
             instant: std::time::Instant::now(),
             time: 0.0,
             last_time: 0.0,
-            dt: 0.0
+            dt: 0.0,
+            fps_accum: 0,
+            fps_time_accum: 0.0
         }
     }
 }
@@ -211,21 +227,45 @@ impl App {
         self.swapchain_images = images;
     }
 
-    fn update_compute_pipeline_shaderc(&mut self) { // needs to be rewritten to handle errors properly without expects
+    fn update_compute_pipeline_shaderc(&mut self) {
         let source = fs::read_to_string(self.compute_shader_path.clone()).expect("failed to read shader file");
         let entry_point_name = "main";
 
         let shaderc_compiler = shaderc::Compiler::new().unwrap();
         let mut options = shaderc::CompileOptions::new().unwrap();
         options.set_target_env(shaderc::TargetEnv::Vulkan, shaderc::EnvVersion::Vulkan1_3 as u32);
+        options.set_include_callback(|include, include_type, source, _| {
+            let path = match include_type {
+                shaderc::IncludeType::Relative => std::path::Path::new(source).parent().unwrap().join(include),
+                shaderc::IncludeType::Standard => std::path::Path::new("src/shaders/include").join(include),
+            };
+            let content = std::fs::read_to_string(&path).map_err(|e| format!("failed to include {}, {}", include, e))?;
+            Ok(shaderc::ResolvedInclude {
+                resolved_name: path.to_string_lossy().into_owned(),
+                content: content,
+            })
+        });
         options.set_forced_version_profile(460 as u32, shaderc::GlslProfile::Core);
+
         let spirv_bin = shaderc_compiler.compile_into_spirv(
             &source,
             shaderc::ShaderKind::Compute,
             &self.compute_shader_path,
             entry_point_name,
             Some(&options),
-        ).expect("failed to compile glsl shader into spirv");
+        ).unwrap_or_else(|err| { // so it doesn't crash while live-debugging shader
+            eprintln!("{}: {}\n falling back to default shader", self.compute_shader_path, err);
+            let default_path = "src/shaders/default.comp.glsl";
+            let default_src = std::fs::read_to_string(default_path)
+                .expect("failed to read default shader");
+            shaderc_compiler.compile_into_spirv(
+                &default_src,
+                shaderc::ShaderKind::Compute,
+                default_path,
+                entry_point_name,
+                Some(&options),
+            ).expect("failed to compile glsl shader into spirv")
+        });
         
         assert_eq!(Some(&0x07230203), spirv_bin.as_binary().first());
 
@@ -281,6 +321,66 @@ impl App {
         self.compute_pipeline = Some(compute_pipeline);
     }*/
 
+    fn upload_brickmap(&mut self) {
+        //let gpu_brickmap = generate_brickmap();
+        let gpu_brickmap = read_brickmap("assets/nuke.brk").unwrap();
+        self.brickmap_data_size = (gpu_brickmap.bytes.len() / std::mem::size_of::<u32>()) as u32;
+
+        let temporary_accessible_buffer = Buffer::from_iter(
+            self.memory_allocator.as_ref().unwrap().clone(),
+            BufferCreateInfo {
+                usage: BufferUsage::TRANSFER_SRC,
+                ..Default::default()
+            },
+            AllocationCreateInfo {
+                memory_type_filter: MemoryTypeFilter::PREFER_HOST
+                    | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+                ..Default::default()
+            },
+            gpu_brickmap.bytes,
+        )
+        .unwrap();
+
+        let device_local_buffer = Buffer::new_slice::<u32>(
+            self.memory_allocator.as_ref().unwrap().clone(),
+            BufferCreateInfo {
+                usage: BufferUsage::STORAGE_BUFFER | BufferUsage::TRANSFER_DST,
+                ..Default::default()
+            },
+            AllocationCreateInfo {
+                memory_type_filter: MemoryTypeFilter::PREFER_DEVICE,
+                ..Default::default()
+            },
+            self.brickmap_data_size as vulkano::DeviceSize,
+        )
+        .unwrap();
+
+        self.device_local_buffer = Some(device_local_buffer.clone());
+
+        let command_buffer_allocator: Arc<dyn CommandBufferAllocator> =
+            Arc::new(StandardCommandBufferAllocator::new(self.device.as_ref().unwrap().clone(), Default::default()));
+
+        let mut command_buffer_builder = AutoCommandBufferBuilder::primary(
+            command_buffer_allocator.clone(),
+            self.queue.as_ref().unwrap().queue_family_index(),
+            CommandBufferUsage::OneTimeSubmit,
+        )
+        .unwrap();
+        command_buffer_builder.copy_buffer(vulkano::command_buffer::CopyBufferInfo::buffers(
+            temporary_accessible_buffer,
+            device_local_buffer.clone(),
+        ))
+        .unwrap();
+        let command_buffer = command_buffer_builder.build().unwrap();
+
+        command_buffer.execute(self.queue.as_ref().unwrap().clone())
+            .unwrap()
+            .then_signal_fence_and_flush()
+            .unwrap()
+            .wait(None /* timeout */)
+            .unwrap()
+    }
+
     fn update_frame(&mut self) {
         let computed_image = self.computed_image.get_or_insert_with(|| {
             Image::new(
@@ -303,22 +403,31 @@ impl App {
             ImageView::new_default(computed_image.clone()).unwrap()
         });
 
-        // camera mats
-        let view_mat = self.camera.get_view();
-        let proj_mat = self.camera.get_proj(self.width, self.height);
+        // player
+        let view_mat = self.player.get_view();
+        let proj_mat = self.player.get_proj(self.width, self.height);
+        let player_flags = 
+            (self.player.is_placing_voxel as u32) << 1 | 
+            (self.player.is_breaking_voxel as u32) << 0;
 
         #[repr(C)]
         #[derive(Copy, Clone, Default, BufferContents)]
-        struct CameraMats {
+        struct GlobalUniforms {
             view: [[f32; 4]; 4],
             proj: [[f32; 4]; 4],
-            _padding: [f32; 8],
+            time: f32,
+            brickmap_data_size: u32,
+            player_flags: u32,
+            _padding: [f32; 1],
         }
 
-        let uniform_contents = CameraMats{
+        let uniform_contents = GlobalUniforms{
             view: view_mat.clone().into(),
             proj: proj_mat.clone().into(),
-            _padding: [0.0; 8],
+            time: self.time,
+            brickmap_data_size: self.brickmap_data_size,
+            player_flags: player_flags,
+            _padding: [0.0; 1],
         };
 
         self.uniform_allocator = Some(SubbufferAllocator::new(
@@ -345,6 +454,7 @@ impl App {
             [
                 WriteDescriptorSet::image_view(0, computed_image_view.clone()),
                 WriteDescriptorSet::buffer(1, uniform_subbuffer.clone()),
+                WriteDescriptorSet::buffer(2, self.device_local_buffer.as_ref().unwrap().clone()),
             ],
             [],
         ).unwrap();
@@ -394,7 +504,9 @@ impl ApplicationHandler for App {
             .with_inner_size(winit::dpi::PhysicalSize::new(self.width,self.height));
         self.window = Some(Arc::new(event_loop
             .create_window(window_attributes)
-            .unwrap()));
+            .unwrap())
+        );
+
         let library = VulkanLibrary::new().expect("no local Vulkan library/DLL");
 
         let required_extensions = Surface::required_extensions(&event_loop);
@@ -450,9 +562,16 @@ impl ApplicationHandler for App {
             .and_then(|meta| meta.modified())
             .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
 
+        self.upload_brickmap();
+
         //self.update_compute_pipeline_vulkano();
         self.update_compute_pipeline_shaderc();
         self.update_frame();
+
+        if let Some(window) = self.window.as_ref() {
+            let _ = window.set_cursor_grab(winit::window::CursorGrabMode::Locked);
+            window.set_cursor_visible(false);
+        }
 
         println!("Device: {}", self.device.as_ref().unwrap().physical_device().properties().device_name);
     }
@@ -480,6 +599,60 @@ impl ApplicationHandler for App {
                 self.dt = self.time - self.last_time;
                 self.last_time = self.time;
 
+                self.fps_accum += 1;
+                self.fps_time_accum += self.dt;
+
+                if self.fps_time_accum >= 1.0 {
+                    let fps = self.fps_accum as f32 / self.fps_time_accum;
+                    let title = format!("Voxel Vulkano: {:.2}", fps);
+                    self.window.as_ref().unwrap().set_title(&title);
+
+                    self.fps_accum = 0;
+                    self.fps_time_accum = 0.0;
+                }
+
+                let rot = self.player.isom.rotation;
+                let movements = [
+                    (InputButton::Key(KeyCode::KeyW), rot * Vector3::z_axis()),
+                    (InputButton::Key(KeyCode::KeyS), -(rot * Vector3::z_axis())),
+                    (InputButton::Key(KeyCode::KeyA), -(rot * Vector3::x_axis())),
+                    (InputButton::Key(KeyCode::KeyD), rot * Vector3::x_axis()),
+                    //(InputButton::Key(KeyCode::Space), Vector3::y_axis()),
+                    //(InputButton::Key(KeyCode::ShiftLeft), -Vector3::y_axis()),
+                ];
+                let total_movement: Vector3<f32> = movements.iter()
+                    .filter(|(key, _)| self.pressed.contains(key))
+                    .map(|(_, dir)| dir.into_inner())
+                    .sum();
+
+                let mut input_velocity = Vector3::zeros();
+
+                if self.player.physics_enabled {
+                    input_velocity += total_movement;
+                    if(input_velocity.norm() > 0.0 && self.player.is_on_ground == true) {
+                        input_velocity = input_velocity.normalize() * self.player.speed;
+                    }
+
+                    self.player.velocity += input_velocity;
+                } else {
+                    self.player.isom.translation.vector += total_movement * self.dt * self.player.speed;
+                }
+
+                let left_mouse = self.pressed.contains(&InputButton::Mouse(MouseButton::Left));
+                let right_mouse = self.pressed.contains(&InputButton::Mouse(MouseButton::Right));
+
+                self.player.is_breaking_voxel = left_mouse && !right_mouse;
+                self.player.is_placing_voxel = right_mouse && !left_mouse;
+                
+                self.player.speed = if self.pressed.contains(&InputButton::Key(KeyCode::ControlLeft)) {200.0} else {50.0};
+
+                if self.pressed.contains(&InputButton::Key(KeyCode::Escape)) {
+                    event_loop.exit();
+                }
+                if self.pressed.contains(&InputButton::Key(KeyCode::KeyP)) {
+                    self.player.physics_enabled = !self.player.physics_enabled;
+                }
+
                 let compute_shader_modified = fs::metadata(&self.compute_shader_path).unwrap().modified().unwrap();
                 if compute_shader_modified > self.compute_shader_last_modified {
                     //self.update_compute_pipeline_vulkano();
@@ -487,26 +660,31 @@ impl ApplicationHandler for App {
                     self.compute_shader_last_modified = compute_shader_modified;
                 }
 
+                self.player.update_physics(self.dt);
                 self.update_frame();
                 self.window.as_ref().unwrap().request_redraw();
             },
-            WindowEvent::KeyboardInput{device_id, event, is_synthetic: false} => {
-                if event.state.is_pressed() {
-                    match event.physical_key {
-                        PhysicalKey::Code(KeyCode::KeyW) => self.camera.isom.translation.vector +=
-                            (self.camera.isom.rotation * Vector3::z_axis()).into_inner() * self.camera.speed * self.dt,        
-                        PhysicalKey::Code(KeyCode::KeyS) => self.camera.isom.translation.vector -=
-                            (self.camera.isom.rotation * Vector3::z_axis()).into_inner() * self.camera.speed * self.dt,
-                        PhysicalKey::Code(KeyCode::KeyA) => self.camera.isom.translation.vector -=
-                            (self.camera.isom.rotation * Vector3::x_axis()).into_inner() * self.camera.speed * self.dt,
-                        PhysicalKey::Code(KeyCode::KeyD) => self.camera.isom.translation.vector +=
-                            (self.camera.isom.rotation * Vector3::x_axis()).into_inner() * self.camera.speed * self.dt,
-                        PhysicalKey::Code(KeyCode::Space) => self.camera.isom.translation.vector.y += self.camera.speed * self.dt,
-                        PhysicalKey::Code(KeyCode::ShiftLeft) => self.camera.isom.translation.vector.y -= self.camera.speed * self.dt,
-                        _ => (),
-                    }
+            WindowEvent::KeyboardInput{device_id: _, event, is_synthetic: false} => {
+                if let PhysicalKey::Code(code) = event.physical_key {
+                    match event.state {
+                        ElementState::Pressed => {
+                            self.pressed.insert(InputButton::Key(code));
+                        },
+                        ElementState::Released => {
+                            self.pressed.remove(&InputButton::Key(code));
+                        },
+                    };
                 }
-                
+            },
+            WindowEvent::MouseInput{device_id: _, state, button} => {
+                match state {
+                    ElementState::Pressed => {
+                        self.pressed.insert(InputButton::Mouse(button));
+                    },
+                    ElementState::Released => {
+                        self.pressed.remove(&InputButton::Mouse(button));
+                    },
+                };
             },
             _ => (),
         }
@@ -515,7 +693,7 @@ impl ApplicationHandler for App {
     fn device_event(&mut self, event_loop: &ActiveEventLoop, _id: winit::event::DeviceId, event: DeviceEvent) {
         match event {
             DeviceEvent::MouseMotion{delta: (dx, dy)} => {
-                self.camera.update_orientation(dx as f32, dy as f32);
+                self.player.update_orientation(dx as f32, dy as f32);
             },
             _ => (),
         }
