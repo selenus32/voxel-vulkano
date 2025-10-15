@@ -1,5 +1,5 @@
 ﻿# in progress
 new project to try rust...
-no voxels yet...
 
-
+preliminary showcase:
+![example](example.png)
