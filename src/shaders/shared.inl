@@ -8,6 +8,12 @@ layout(set = 0, binding = 1) uniform GlobalUniforms {
     float _padding[1];
 } glob;
 
+/*layout(set = 0, binding = 2) uniform GPUOut {
+    vec3 collision_offset;
+    uint collision_flags;
+    float _padding[1];
+} gpu_out;*/
+
 layout(set = 0, binding = 2) buffer BrickMap {
     uint data[];
 } brickmap;
@@ -33,7 +39,8 @@ vec4 unpack_color(uint color) {
     float g = float((color >> 16) & 0xFF) / 255.0; 
     float b  = float((color >> 8) & 0xFF) / 255.0; 
     float a = float(color & 0xFF) / 255.0;     
-    return vec4(a,b,g,r);
+    return vec4(r,g,b,a);
+    //return vec4(r,g,b,a);
 }
 
 vec3 ACESFilm(vec3 x)

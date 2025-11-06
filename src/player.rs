@@ -21,6 +21,7 @@ pub struct Player {
     pub physics_enabled: bool,
     pub velocity: Vector3<f32>,
     pub collision_offset: Vector3<f32>, // unaffected atm
+    pub collision_flags: u32,
     pub is_colliding: bool,
     pub is_on_ground: bool,
     pub is_ceiling_low: bool,
@@ -42,6 +43,7 @@ impl Default for Player {
             physics_enabled: false,
             velocity: Vector3::zeros(),
             collision_offset: Vector3::zeros(),
+            collision_flags: 0,
             is_colliding: false,
             is_on_ground: false,
             is_ceiling_low: false,

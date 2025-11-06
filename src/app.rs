@@ -76,7 +76,7 @@ use winit::{
 };
 use std::{
     fs,
-    time::SystemTime,
+    time::{SystemTime},
     sync::Arc
 };
 use std::collections::HashSet;
@@ -89,7 +89,7 @@ use na::{
 use crate::player::Player;
 
 use crate::voxels::brickmap::*;
-use crate::voxels::tree64;
+//use crate::voxels::tree64;
 
 #[derive(Hash, Eq, PartialEq, Debug)]
 enum InputButton {
@@ -322,8 +322,9 @@ impl App {
     }*/
 
     fn upload_brickmap(&mut self) {
-        //let gpu_brickmap = generate_brickmap();
-        let gpu_brickmap = read_brickmap("assets/nuke.brk").unwrap();
+        //let gpu_brickmap = generate_brickmap().bytes;
+        let gpu_brickmap = read_voxel_model("assets/haunted_house.vox");
+        //let gpu_brickmap = read_voxel_model("assets/nuke.brk");
         self.brickmap_data_size = (gpu_brickmap.bytes.len() / std::mem::size_of::<u32>()) as u32;
 
         let temporary_accessible_buffer = Buffer::from_iter(
@@ -437,10 +438,48 @@ impl App {
                 memory_type_filter: MemoryTypeFilter::PREFER_HOST | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
                 ..Default::default()
             },
-        ));
+        ));        
 
         let uniform_subbuffer = self.uniform_allocator.as_ref().unwrap().allocate_sized().unwrap();
         *uniform_subbuffer.write().unwrap() = uniform_contents.clone();
+        /*
+        #[repr(C)]
+        #[derive(Copy, Clone, Default, BufferContents)]
+        struct GPUOut {
+            collision_offset: [f32; 3],
+            collision_flags: u32,
+            _padding: [f32; 3],
+        }
+
+        let gpu_out_contents = GPUOut{
+            collision_offset: self.player.collision_offset.into(),
+            collision_flags: self.player.collision_flags,
+            _padding: [0.0; 3],
+        };
+        
+        let gpu_out_buffer = Buffer::new_sized(
+            self.memory_allocator.as_ref().unwrap().clone(),
+            BufferCreateInfo {
+                usage: BufferUsage::TRANSFER_DST,
+                ..Default::default()
+            },
+            AllocationCreateInfo {
+                memory_type_filter: MemoryTypeFilter::PREFER_HOST |
+                    MemoryTypeFilter::HOST_RANDOM_ACCESS,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let gpu_out_subbuffer = self.uniform_allocator.as_ref().unwrap().allocate_sized().unwrap();
+        *gpu_out_subbuffer.write().unwrap() = gpu_out_contents.clone();*/
+
+        /*layout(set = 0, binding = 2) uniform GPUOut {
+            vec3 collision_offset;
+            uint collision_flags;
+            float _padding[1];
+        } gpu_out;*/
+
 
         self.descriptor_set_allocator = Some(Arc::new(StandardDescriptorSetAllocator::new(
             self.device.as_ref().unwrap().clone(),
@@ -454,6 +493,7 @@ impl App {
             [
                 WriteDescriptorSet::image_view(0, computed_image_view.clone()),
                 WriteDescriptorSet::buffer(1, uniform_subbuffer.clone()),
+                //WriteDescriptorSet::buffer(2, gpu_out_subbuffer.clone()),
                 WriteDescriptorSet::buffer(2, self.device_local_buffer.as_ref().unwrap().clone()),
             ],
             [],
@@ -493,6 +533,8 @@ impl App {
             .then_swapchain_present(self.queue.as_ref().unwrap().clone(),SwapchainPresentInfo::swapchain_image_index(self.swapchain.as_ref().unwrap().clone(), swapchain_image_index))
             .then_signal_fence_and_flush()
             .unwrap();
+
+
         future.wait(None).unwrap();
     }
 }
@@ -617,8 +659,8 @@ impl ApplicationHandler for App {
                     (InputButton::Key(KeyCode::KeyS), -(rot * Vector3::z_axis())),
                     (InputButton::Key(KeyCode::KeyA), -(rot * Vector3::x_axis())),
                     (InputButton::Key(KeyCode::KeyD), rot * Vector3::x_axis()),
-                    //(InputButton::Key(KeyCode::Space), Vector3::y_axis()),
-                    //(InputButton::Key(KeyCode::ShiftLeft), -Vector3::y_axis()),
+                    (InputButton::Key(KeyCode::Space), Vector3::y_axis()),
+                    (InputButton::Key(KeyCode::ShiftLeft), -Vector3::y_axis()),
                 ];
                 let total_movement: Vector3<f32> = movements.iter()
                     .filter(|(key, _)| self.pressed.contains(key))
@@ -629,7 +671,7 @@ impl ApplicationHandler for App {
 
                 if self.player.physics_enabled {
                     input_velocity += total_movement;
-                    if(input_velocity.norm() > 0.0 && self.player.is_on_ground == true) {
+                    if input_velocity.norm() > 0.0 && self.player.is_on_ground == true {
                         input_velocity = input_velocity.normalize() * self.player.speed;
                     }
 
@@ -690,7 +732,7 @@ impl ApplicationHandler for App {
         }
     }
 
-    fn device_event(&mut self, event_loop: &ActiveEventLoop, _id: winit::event::DeviceId, event: DeviceEvent) {
+    fn device_event(&mut self, _event_loop: &ActiveEventLoop, _id: winit::event::DeviceId, event: DeviceEvent) {
         match event {
             DeviceEvent::MouseMotion{delta: (dx, dy)} => {
                 self.player.update_orientation(dx as f32, dy as f32);

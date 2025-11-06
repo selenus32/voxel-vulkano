@@ -1,14 +1,14 @@
-
-use noise::{NoiseFn, Perlin};
-use std::io;
 use std::io::prelude::*;
 use std::fs::File;
+use std::path::Path;
+use dot_vox::*;
+use glam::{IVec3, UVec3, Vec3, Mat3};
 
 const BRICK_SIZE: usize = 8;
-const CELL_SIZE: usize = 64;
+const CELL_SIZE: usize = 1;
 const BRICK_VOL: usize = BRICK_SIZE * BRICK_SIZE * BRICK_SIZE;
 
-
+#[derive(Clone)]
 struct Brick {
     data: [u32; BRICK_VOL],
 }
@@ -17,51 +17,282 @@ pub struct GPUBrickMap {
     pub bytes: Vec<u8>,
 }
 
-struct BrickMap {
-    magic: u32,
+// taken from dot_vox/examples/traverse_graph.rs
+fn iterate_vox_tree(vox_tree: &DotVoxData, mut fun: impl FnMut(&Model, &Vec3, &Rotation)) {
+    match &vox_tree.scenes[0] {
+        SceneNode::Transform {
+            attributes: _,
+            frames: _,
+            child,
+            layer_id: _,
+        } => {
+            iterate_vox_tree_inner(
+                vox_tree,
+                *child,
+                Vec3::new(0.0, 0.0, 0.0),
+                Rotation::IDENTITY,
+                &mut fun,
+            );
+        }
+        _ => {
+            panic!("The root node for a magicka voxel DAG should be a Transform node")
+        }
+    }
+}
+
+// taken from dot_vox/examples/traverse_graph.rs
+fn iterate_vox_tree_inner(
+    vox_tree: &DotVoxData,
+    current_node: u32,
+    translation: Vec3,
+    rotation: Rotation,
+    fun: &mut impl FnMut(&Model, &Vec3, &Rotation),
+) {
+    match &vox_tree.scenes[current_node as usize] {
+        SceneNode::Transform {
+            attributes: _,
+            frames,
+            child,
+            layer_id: _,
+        } => {
+            // In case of a Transform node, the potential translation and rotation is added
+            // to the global transform to all of the nodes children nodes
+            let translation = if let Some(t) = frames[0].attributes.get("_t") {
+                let translation_delta = t
+                    .split(" ")
+                    .map(|x| x.parse().expect("Not an integer!"))
+                    .collect::<Vec<i32>>();
+                debug_assert_eq!(translation_delta.len(), 3);
+                translation
+                    + Vec3::new(
+                        translation_delta[0] as f32,
+                        translation_delta[1] as f32,
+                        translation_delta[2] as f32,
+                    )
+            } else {
+                translation
+            };
+            let rotation = if let Some(r) = frames[0].attributes.get("_r") {
+                rotation
+                    * Rotation::from_byte(
+                        r.parse()
+                            .expect("Expected valid u8 byte to parse rotation matrix"),
+                    )
+            } else {
+                Rotation::IDENTITY
+            };
+
+            iterate_vox_tree_inner(vox_tree, *child, translation, rotation, fun);
+        }
+        SceneNode::Group {
+            attributes: _,
+            children,
+        } => {
+            // in case the current node is a group, the index variable stores the current
+            // child index
+            for child_node in children {
+                iterate_vox_tree_inner(vox_tree, *child_node, translation, rotation, fun);
+            }
+        }
+        SceneNode::Shape {
+            attributes: _,
+            models,
+        } => {
+            // in case the current node is a shape: it's a leaf node and it contains
+            // models(voxel arrays)
+            for model in models {
+                fun(
+                    &vox_tree.models[model.model_id as usize],
+                    &translation,
+                    &rotation,
+                );
+            }
+        }
+    }
+}
+
+struct VoxelMap {
     position: [u32; 3],
     extent: [u32; 3],
-    indices: Vec<u32>,
-    bricks: Vec<Brick>,
 }
 
-pub fn read_brickmap (path: &str) -> io::Result<GPUBrickMap> {
-    let mut f = File::open(path)?;
+pub fn get_voxel_bytes(model_filepath: &str) -> GPUBrickMap {
+    let mut f = File::open(model_filepath).expect("failed to open model file");
     let mut bytes = Vec::new();
 
-    f.read_to_end(&mut bytes)?;
+    f.read_to_end(&mut bytes).expect("failed to read model file to end");
 
-    Ok(GPUBrickMap {bytes: bytes})
+    GPUBrickMap{bytes}
 }
 
-pub fn generate_brickmap () -> GPUBrickMap {
-    let mut brickmap = Box::new(BrickMap {
-        magic: u32::from_ne_bytes(*b"brk\0"),
+pub fn parse_vox_to_brk(data: &DotVoxData) -> GPUBrickMap {
+    if data.models.is_empty() {
+        println!("Magicavoxel models are empty");
+        return GPUBrickMap { bytes: Vec::new() };
+    }
+
+    // taken from dot_vox/examples/traverse_graph.rs
+    let mut min_extent = Vec3::splat(f32::MAX);
+    let mut max_extent = Vec3::splat(f32::MIN);
+
+    iterate_vox_tree(data, |model, position, _orientation| {
+        let model_size = Vec3::new(model.size.x as f32, model.size.y as f32, model.size.z as f32);
+        let half_size = model_size / 2.0;
+
+        let model_min = *position - half_size;
+        let model_max = *position + half_size;
+
+        min_extent = min_extent.min(model_min);
+        max_extent = max_extent.max(model_max);
+    });
+
+    let total_extent_f = max_extent - min_extent;
+    let bricks_extent_x = ((total_extent_f.x).ceil() as usize + BRICK_SIZE - 1) / BRICK_SIZE;
+    let bricks_extent_y = ((total_extent_f.y).ceil() as usize + BRICK_SIZE - 1) / BRICK_SIZE;
+    let bricks_extent_z = ((total_extent_f.z).ceil() as usize + BRICK_SIZE - 1) / BRICK_SIZE;
+
+
+    let mut bricks: Vec<Brick> =
+        vec![Brick { data: [0; BRICK_VOL] }; (bricks_extent_x * bricks_extent_y * bricks_extent_z) as usize];
+
+    // iterate through .vox scene models and their voxels
+    // store voxel colours in each brick
+    let min_extent_u = min_extent.floor().as_uvec3();
+    iterate_vox_tree(data, |model, position, orientation| {
+        let model_center = *position;
+        let mat = orientation.to_cols_array_2d();
+
+        for voxel in &model.voxels {
+            let colour = &data.palette[voxel.i as usize];
+            if colour.a == 0 { continue; }
+
+            let voxel_value: u32 = ((colour.r as u32) << 24)
+                | ((colour.g as u32) << 16)
+                | ((colour.b as u32) << 8)
+                | ((colour.a as u32) << 0);
+
+            let local_voxel = Vec3::new(voxel.x as f32, voxel.y as f32, voxel.z as f32);
+
+            let rotated_voxel = Vec3::new(
+                mat[0][0] * local_voxel.x + mat[0][1] * local_voxel.y + mat[0][2] * local_voxel.z,
+                mat[1][0] * local_voxel.x + mat[1][1] * local_voxel.y + mat[1][2] * local_voxel.z,
+                mat[2][0] * local_voxel.x + mat[2][1] * local_voxel.y + mat[2][2] * local_voxel.z,
+            );
+
+            let voxel_pos_f = model_center + rotated_voxel - min_extent;
+            let voxel_pos = voxel_pos_f.floor().as_uvec3();
+
+            let brick_i = voxel_pos / BRICK_SIZE as u32;
+            let in_brick_i = voxel_pos % BRICK_SIZE as u32;
+
+            let brick_index = brick_i.x as usize
+                + brick_i.y as usize * bricks_extent_x
+                + brick_i.z as usize * bricks_extent_x * bricks_extent_y;
+
+            let in_brick_index = in_brick_i.x as usize
+                + in_brick_i.y as usize * BRICK_SIZE
+                + in_brick_i.z as usize * BRICK_SIZE * BRICK_SIZE;
+
+            bricks[brick_index].data[in_brick_index] = voxel_value;
+        }
+    });
+
+    let mut bytes = Vec::new();
+    let magic = u32::from_ne_bytes(*b"brk\0");
+    bytes.extend(&magic.to_ne_bytes());
+
+    let position: [u32; 3] = [0, 0, 0];
+    let total_extent: [u32; 3] = [
+        bricks_extent_x as u32 * BRICK_SIZE as u32,
+        bricks_extent_y as u32 * BRICK_SIZE as u32,
+        bricks_extent_z as u32 * BRICK_SIZE as u32,
+    ];
+    bytes.extend(bytemuck::cast_slice(&position));
+    bytes.extend(bytemuck::cast_slice(&total_extent));
+
+    let mut indices: Vec<u32> = vec![0; bricks.len()];
+    for i in 0..bricks.len() {
+        indices[i] = i as u32 | 0x80000000; // msb for loaded
+    }
+    bytes.extend(bytemuck::cast_slice(&indices));
+
+    for brick in &bricks {
+        bytes.extend(bytemuck::cast_slice(&brick.data));
+    }
+
+    GPUBrickMap { bytes }
+}
+
+pub fn read_voxel_model (model_filepath: &str) -> GPUBrickMap {
+    let path = Path::new(model_filepath);
+    let format = path.extension()
+        .and_then(|ext| ext.to_str())
+        .unwrap_or("");
+
+    match format {
+        "vox" => {
+            println!("Parsing magicavoxel file");
+            //let vox_bytes = get_voxel_bytes(model_filepath)?;
+            let result = load(model_filepath)
+                .ok()
+                .expect("expected a valid .vox file");
+
+            let brk_bytes = parse_vox_to_brk(&result);
+            //Ok(brk_bytes)
+            
+            brk_bytes
+        },
+        "brk" => {
+            println!("Parsing brickmap file");
+            get_voxel_bytes(model_filepath)
+        },
+        "" => {
+            println!("No usable voxel format given");
+            GPUBrickMap{bytes: Vec::new()}
+        }
+        _ => {
+            println!("No usable voxel format given");
+            GPUBrickMap{bytes: Vec::new()}
+        }
+    }
+}
+
+// in progress/testing generation
+/*pub fn generate_brickmap () -> GPUBrickMap {
+    let brickmap = Box::new(VoxelMap {
         position: [0,0,0],
         extent: [CELL_SIZE as u32, CELL_SIZE as u32, CELL_SIZE as u32],
-        indices: Vec::new(),
-        bricks: Vec::new(),
     });
+
+    let mut indices: Vec<u32> = Vec::new();
+    let mut bricks: Vec<Brick> = Vec::new();
+
+    let magic = u32::from_ne_bytes(*b"brk\0");
 
     let perlin = Perlin::new(1);
 
-    brickmap.extent[0] *= 8;
-    brickmap.extent[1] *= 8;
-    brickmap.extent[2] *= 8;
+    //brickmap.extent[0] = 8;
+    //brickmap.extent[1] = 8;
+    //brickmap.extent[2] = 8;
 
-    brickmap.indices.resize(CELL_SIZE * CELL_SIZE * CELL_SIZE, 0);
-    for cell_z in 0..CELL_SIZE {
+    let r: u32 = 255;
+    let g: u32 = 156;
+    let b: u32 = 68;
+    let a: u32 = 255;
+
+    indices.resize(CELL_SIZE * CELL_SIZE * CELL_SIZE, 0);
+    for cell_x in 0..CELL_SIZE {
         for cell_y in 0..CELL_SIZE {
-            for cell_x in 0..CELL_SIZE {
+            for cell_z in 0..CELL_SIZE {
                 let mut brick = Brick{data: [0; BRICK_VOL]};
-                let mut empty = true;
+                let mut loaded = true;
                 let mut lod_mask = 0;
 
                 let scale = 0.6;
                 
-                for z in 0..BRICK_SIZE {
+                for x in 0..BRICK_SIZE {
                     for y in 0..BRICK_SIZE {
-                        for x in 0..BRICK_SIZE {
+                        for z in 0..BRICK_SIZE {
                             let global_x = cell_x * BRICK_SIZE + x;
                             let global_y = cell_y * BRICK_SIZE + y;
                             let global_z = cell_z * BRICK_SIZE + z;
@@ -76,38 +307,38 @@ pub fn generate_brickmap () -> GPUBrickMap {
                             if global_y <= (terrain_height as usize * BRICK_SIZE + x) {
                                 let voxel_index = z + y * BRICK_SIZE + x * BRICK_SIZE * BRICK_SIZE;
 
-                                let r: u32 = 255;
-                                let g: u32 = 156;
-                                let b: u32 = 68;
-                                let a: u32 = 255;
-                                let voxel_value: u32 = (r << 24) | (g << 16) | (b << 8) | (a << 0);
+                                
+                                let voxel_value: u32 = ((x as u32) << 24) | ((y as u32) << 16) | ((z as u32) << 8) | (a << 0);
                                 brick.data[voxel_index] = voxel_value;
 
-                                empty = false;
-                                lod_mask |= 1 << (((z & 0b100) >> 2) + ((y & 0b100) >> 1) + (x & 0b100));
+                                loaded = true;
+                                lod_mask |= 1 << (((x & 0b100) >> 2) + ((y & 0b100) >> 1) + (z & 0b100));
                             }
                         }
                     }
                 }
 
-                if !empty {
-                    brickmap.bricks.push(brick);
-                    brickmap.indices[cell_z + cell_y * CELL_SIZE + cell_x * CELL_SIZE * CELL_SIZE]
-                        = (brickmap.bricks.len() as u32 - 1) | 0x80000000 | (lod_mask << 12);
+                if loaded {
+                    bricks.push(brick);
+                    indices[cell_x + cell_y * CELL_SIZE + cell_z * CELL_SIZE * CELL_SIZE]
+                        = (bricks.len() as u32 - 1) | 0x80000000 | lod_mask << 12;
+                } else {
+                    indices[cell_x + cell_y * CELL_SIZE + cell_z * CELL_SIZE * CELL_SIZE]
+                        = (r << 16) | (g << 8) | (b << 0);
                 }
             }
         }
     }
     
     let mut bytes = Vec::new();
-    bytes.extend(&brickmap.magic.to_ne_bytes());
+    bytes.extend(&magic.to_ne_bytes());
     bytes.extend(bytemuck::cast_slice(&brickmap.position));
     bytes.extend(bytemuck::cast_slice(&brickmap.extent));
-    bytes.extend(bytemuck::cast_slice(&brickmap.indices));
+    bytes.extend(bytemuck::cast_slice(&indices));
 
-    for brick in &brickmap.bricks {
+    for brick in &bricks {
         bytes.extend(bytemuck::cast_slice(&brick.data));
     }
 
     GPUBrickMap { bytes: bytes }
-}
+}*/
