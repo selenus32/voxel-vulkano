@@ -20,7 +20,7 @@ pub struct Player {
     pub is_breaking_voxel: bool,
     pub physics_enabled: bool,
     pub velocity: Vector3<f32>,
-    pub collision_offset: Vector3<f32>, // unaffected atm
+    pub collision_offset: Vector3<f32>,
     pub collision_flags: u32,
     pub is_colliding: bool,
     pub is_on_ground: bool,
@@ -34,7 +34,7 @@ impl Default for Player {
             fov: 90.0, 
             near: 0.1, 
             far: 100.0, 
-            yaw: -90.0, 
+            yaw: 0.0, 
             pitch: 0.0, 
             mouse_sens: 0.1,
             speed: 100.0,
@@ -67,7 +67,7 @@ impl Player {
             } else {
                 if self.is_colliding {
                     t += self.collision_offset;
-                    self.velocity = Vector3::zeros();
+                    //self.velocity = Vector3::zeros();
                 }
 
                 self.velocity.y = 0.0;

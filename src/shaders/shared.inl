@@ -8,13 +8,13 @@ layout(set = 0, binding = 1) uniform GlobalUniforms {
     float _padding[1];
 } glob;
 
-/*layout(set = 0, binding = 2) uniform GPUOut {
+layout(set = 0, binding = 2) buffer GPUOut {
     vec3 collision_offset;
     uint collision_flags;
-    float _padding[1];
-} gpu_out;*/
+    float _padding[3];
+} gpu_out;
 
-layout(set = 0, binding = 2) buffer BrickMap {
+layout(set = 0, binding = 3) buffer BrickMap {
     uint data[];
 } brickmap;
 

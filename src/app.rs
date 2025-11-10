@@ -95,6 +95,25 @@ enum InputButton {
     Mouse(MouseButton),
 }
 
+#[repr(C)]
+#[derive(Copy, Clone, Default, BufferContents)]
+struct GlobalUniforms {
+    view: [[f32; 4]; 4],
+    proj: [[f32; 4]; 4],
+    time: f32,
+    voxel_bytes_size: u32,
+    player_flags: u32,
+    _padding: [f32; 1],
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Default, BufferContents)]
+struct GPUOut {
+    collision_offset: [f32; 3],
+    collision_flags: u32,
+    _padding: [f32; 3],
+}
+
 pub struct App {
     window: Option<Arc<Window>>,
     surface: Option<Arc<Surface>>,
@@ -115,7 +134,7 @@ pub struct App {
     height: u32,
     player: Player,
     device_local_buffer: Option<Subbuffer<[u32]>>,
-    brickmap_data_size: u32,
+    voxel_bytes_size: u32,
     pressed: HashSet<InputButton>,
     instant: std::time::Instant,
     time: f32,
@@ -147,7 +166,7 @@ impl Default for App {
             height: 1024,
             player: Player::default(),
             device_local_buffer: None,
-            brickmap_data_size: 0,
+            voxel_bytes_size: 0,
             pressed: HashSet::new(),
             instant: std::time::Instant::now(),
             time: 0.0,
@@ -319,11 +338,9 @@ impl App {
         self.compute_pipeline = Some(compute_pipeline);
     }*/
 
-    fn upload_brickmap(&mut self) {
-        //let gpu_brickmap = generate_brickmap().bytes;
+    fn upload_voxel_bytes(&mut self) {
         let gpu_bytes = read_voxel_model("assets/disney.vox");
-        //let gpu_brickmap = read_voxel_model("assets/nuke.brk");
-        self.brickmap_data_size = (gpu_bytes.len() / std::mem::size_of::<u32>()) as u32;
+        self.voxel_bytes_size = (gpu_bytes.len() / std::mem::size_of::<u32>()) as u32;
 
         let temporary_accessible_buffer = Buffer::from_iter(
             self.memory_allocator.as_ref().unwrap().clone(),
@@ -350,7 +367,7 @@ impl App {
                 memory_type_filter: MemoryTypeFilter::PREFER_DEVICE,
                 ..Default::default()
             },
-            self.brickmap_data_size as vulkano::DeviceSize,
+            self.voxel_bytes_size as vulkano::DeviceSize,
         )
         .unwrap();
 
@@ -405,57 +422,33 @@ impl App {
         // player
         let view_mat = self.player.get_view();
         let proj_mat = self.player.get_proj(self.width, self.height);
-        let player_flags = 
-            (self.player.is_placing_voxel as u32) << 1 | 
-            (self.player.is_breaking_voxel as u32) << 0;
+        let player_flags = (self.player.is_placing_voxel as u32) << 1 | (self.player.is_breaking_voxel as u32) << 0; 
 
-        #[repr(C)]
-        #[derive(Copy, Clone, Default, BufferContents)]
-        struct GlobalUniforms {
-            view: [[f32; 4]; 4],
-            proj: [[f32; 4]; 4],
-            time: f32,
-            brickmap_data_size: u32,
-            player_flags: u32,
-            _padding: [f32; 1],
-        }
-
-        let uniform_contents = GlobalUniforms{
+        let uniform_subbuffer = self.uniform_allocator.as_ref().unwrap().allocate_sized().unwrap();
+        *uniform_subbuffer.write().unwrap() = GlobalUniforms{
             view: view_mat.clone().into(),
             proj: proj_mat.clone().into(),
             time: self.time,
-            brickmap_data_size: self.brickmap_data_size,
+            voxel_bytes_size: self.voxel_bytes_size,
             player_flags: player_flags,
             _padding: [0.0; 1],
         };
-
-        self.uniform_allocator = Some(SubbufferAllocator::new(
+       
+        let gpu_out_device_subbuffer: Subbuffer<GPUOut> = Buffer::new_sized(
             self.memory_allocator.as_ref().unwrap().clone(),
-            SubbufferAllocatorCreateInfo {
-                buffer_usage: BufferUsage::UNIFORM_BUFFER,
-                memory_type_filter: MemoryTypeFilter::PREFER_HOST | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+            BufferCreateInfo {
+                usage: BufferUsage::STORAGE_BUFFER | BufferUsage::TRANSFER_SRC,
                 ..Default::default()
             },
-        ));        
+            AllocationCreateInfo {
+                memory_type_filter: MemoryTypeFilter::PREFER_DEVICE |
+                    MemoryTypeFilter::HOST_RANDOM_ACCESS,
+                ..Default::default()
+            },
+        )
+        .unwrap();
 
-        let uniform_subbuffer = self.uniform_allocator.as_ref().unwrap().allocate_sized().unwrap();
-        *uniform_subbuffer.write().unwrap() = uniform_contents.clone();
-        /*
-        #[repr(C)]
-        #[derive(Copy, Clone, Default, BufferContents)]
-        struct GPUOut {
-            collision_offset: [f32; 3],
-            collision_flags: u32,
-            _padding: [f32; 3],
-        }
-
-        let gpu_out_contents = GPUOut{
-            collision_offset: self.player.collision_offset.into(),
-            collision_flags: self.player.collision_flags,
-            _padding: [0.0; 3],
-        };
-        
-        let gpu_out_buffer = Buffer::new_sized(
+        let gpu_out_host_subbuffer: Subbuffer<GPUOut> = Buffer::new_sized(
             self.memory_allocator.as_ref().unwrap().clone(),
             BufferCreateInfo {
                 usage: BufferUsage::TRANSFER_DST,
@@ -469,15 +462,18 @@ impl App {
         )
         .unwrap();
 
-        let gpu_out_subbuffer = self.uniform_allocator.as_ref().unwrap().allocate_sized().unwrap();
-        *gpu_out_subbuffer.write().unwrap() = gpu_out_contents.clone();*/
+        let mut gpu_out_contents = GPUOut{
+            collision_offset: [0.0; 3],
+            collision_flags: 0,
+            _padding: [0.0; 3],
+        };
 
-        /*layout(set = 0, binding = 2) uniform GPUOut {
-            vec3 collision_offset;
-            uint collision_flags;
-            float _padding[1];
-        } gpu_out;*/
+        gpu_out_contents = *gpu_out_host_subbuffer.read().unwrap();
 
+        self.player.collision_offset = Vector3::from(gpu_out_contents.collision_offset);
+        self.player.is_colliding = ((gpu_out_contents.collision_flags >> 0) & 1) != 0;
+        self.player.is_on_ground = ((gpu_out_contents.collision_flags >> 1) & 1) != 0;
+        self.player.is_ceiling_low = ((gpu_out_contents.collision_flags >> 2) & 1) != 0;
 
         self.descriptor_set_allocator = Some(Arc::new(StandardDescriptorSetAllocator::new(
             self.device.as_ref().unwrap().clone(),
@@ -491,8 +487,8 @@ impl App {
             [
                 WriteDescriptorSet::image_view(0, computed_image_view.clone()),
                 WriteDescriptorSet::buffer(1, uniform_subbuffer.clone()),
-                //WriteDescriptorSet::buffer(2, gpu_out_subbuffer.clone()),
-                WriteDescriptorSet::buffer(2, self.device_local_buffer.as_ref().unwrap().clone()),
+                WriteDescriptorSet::buffer(2, gpu_out_device_subbuffer.clone()),
+                WriteDescriptorSet::buffer(3, self.device_local_buffer.as_ref().unwrap().clone()),
             ],
             [],
         ).unwrap();
@@ -522,6 +518,11 @@ impl App {
             .dispatch([(self.width + 7) / 8, (self.height + 7) / 8, 1])
             .unwrap()
             .blit_image(compute_blit_info)
+            .unwrap()
+            .copy_buffer(vulkano::command_buffer::CopyBufferInfo::buffers(
+                gpu_out_device_subbuffer.clone(),
+                gpu_out_host_subbuffer,
+            ))
             .unwrap();
         }
         let command_buffer = command_buffer_builder.build().unwrap();
@@ -602,9 +603,19 @@ impl ApplicationHandler for App {
             .and_then(|meta| meta.modified())
             .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
 
-        self.upload_brickmap();
+        self.upload_voxel_bytes();
 
         //self.update_compute_pipeline_vulkano();
+
+        self.uniform_allocator = Some(SubbufferAllocator::new(
+            self.memory_allocator.as_ref().unwrap().clone(),
+            SubbufferAllocatorCreateInfo {
+                buffer_usage: BufferUsage::UNIFORM_BUFFER,
+                memory_type_filter: MemoryTypeFilter::PREFER_HOST | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+                ..Default::default()
+            },
+        )); 
+
         self.update_compute_pipeline_shaderc();
         self.update_frame();
 

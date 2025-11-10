@@ -1,5 +1,4 @@
-use dot_vox::*;
-use glam::{IVec3, UVec3, Vec3, Mat3};
+use glam::{IVec3, UVec3, Vec3};
 
 const BRICK_SIZE: usize = 8;
 const CELL_SIZE: usize = 1;

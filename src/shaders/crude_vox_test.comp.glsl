@@ -7,7 +7,7 @@ layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 
 // problems with the shadows that i need to fix otherwise all is fine
 
-//#include "noise3D.glsl"
+#include "noise3D.glsl"
 #include "shared.inl"
 
 #define BRICK_SIZE 8
@@ -185,8 +185,8 @@ vec3 renderSky(vec3 ro, vec3 rd ) {
     float t = (5000.0-ro.y)/rd.y;
     if( rd.y > 0.04 )
     {
-        //float cl = snoise(vec3(ro+t*rd)*0.0001);
-        float dl = smoothstep(-0.2,0.8,0.);
+        float cl = snoise(vec3(ro+t*rd)*0.0001);
+        float dl = smoothstep(-0.2,0.8,cl);
         col = mix( col, vec3(1.0), 0.3*dl );
     }
     
@@ -231,7 +231,7 @@ shadow_info trace_brick_shadow(vec3 brick_pos, uint brick_i, vec3 rayDir, vec3 i
 float hash(vec3 p) {
     return fract(sin(dot(p ,vec3(12.9898,78.233, 37.719))) * 43758.5453);
 }
-vec3 light_dir = normalize(vec3(-0.1, 0.2, -0.2));
+vec3 light_dir = normalize(vec3(-0.1, 0.3, -0.2));
 vec3 light_color = vec3(1.0);
 vec3 lighting(vec3 norm, vec3 rd, vec3 col, vec3 pos) {
     vec3 N = normalize(norm);
@@ -246,13 +246,13 @@ vec3 lighting(vec3 norm, vec3 rd, vec3 col, vec3 pos) {
     vec3 reflectDir = reflect(-L, N);
     float baseSpec = max(dot(viewDir, reflectDir), 0.0);
 
-    float ao = 0.5 + 0.5 * N.y;
-    ao *= 0.8 + 0.3 * hash(pos * 3.0); 
+    //float ao = 0.5 + 0.5 * N.y;
+    //ao *= 0.8 + 0.3 * hash(pos * 3.0); 
     
     float noise = hash(pos + norm * 10.0);
-    float specular = pow(baseSpec, 16.0) * mix(0.2, 1.0, noise); 
+    float specular = pow(baseSpec, 16.0) * mix(0.2, 0.8, noise); 
 
-    vec3 color = (diffuse + ambient) + specular * light_color;
+    vec3 color = (diffuse + ambient) + specular * light_color;// light_color;
 
     return color;
 }
@@ -279,9 +279,10 @@ hit_info trace_brick(vec3 brick_pos, uint brick_i, vec3 rayDir, vec3 mask) {
         int d = int(floor(max(mini.x, max(mini.y, mini.z))));
 
         if (voxel.hit) {
-            vec4 lighting_result = vec4(lighting(mask, rayDir, voxel.col.rgb, map_pos),1.);
+            //vec4 lighting_result = vec4(lighting(mask, rayDir, voxel.col.rgb, map_pos),1.);
     
-            return hit_info(true,lighting_result,d);
+            //return hit_info(true,lighting_result,d);
+            return hit_info(true,voxel.col,d);
         }
         mask = vec3(lessThanEqual(sideDist.xyz, min(sideDist.yzx, sideDist.zxy)));
         map_pos += ivec3(mask * ray_sign);
@@ -327,7 +328,7 @@ shadow_info trace_brickmap_shadows(vec3 ray_origin, vec3 ray_dir) {
             shadow_info hit = trace_brick_shadow(uv3d*BRICK_SIZE, brick_index, ray_dir, norm, firstVoxel);
 
             if (hit.shadow_factor > 0.0) {
-                return shadow_info(0.2,hit.d);
+                return shadow_info(0.3,hit.d);
             }
         }
         norm = vec3(lessThanEqual(sideDist.xyz, min(sideDist.yzx, sideDist.zxy)));
@@ -337,6 +338,8 @@ shadow_info trace_brickmap_shadows(vec3 ray_origin, vec3 ray_dir) {
     
     return shadow_info(1.0,0.0);
 }
+
+#define SHADOWS 0
 
 hit_info trace_brickmap(ray_data ray) { 
     vec3 ray_pos = ray.origin/BRICK_SIZE;
@@ -362,7 +365,7 @@ hit_info trace_brickmap(ray_data ray) {
         uint brick_index = get_brick(ivec3(map_pos));
 
         if (brick_index == 0) {
-            //break;
+            break;
         }
 
         vec3 mini = ((map_pos-ray_pos) + 0.5 - 0.5*ray_sign)*deltaDist;
@@ -378,13 +381,16 @@ hit_info trace_brickmap(ray_data ray) {
 
         //shadow_info brick_shadow_hit = trace_brick_shadow(uv3d*BRICK_SIZE, brick_i, ray.dir, norm, firstVoxel);
         if (hit.col.a > 0.0) {
-            vec3 shadow_intersect = ray.origin + ray.dir * (d*BRICK_SIZE+hit.d);
-            shadow_intersect += light_dir * 0.001f;
-            //shadow_intersect = 0.5*(floor(shadow_intersect)+ceil(shadow_intersect));
-            //hit_info shadow = trace_brickmap_shadows(shadow_intersect,light_dir);
-            shadow_info shadow = trace_brickmap_shadows(shadow_intersect, light_dir);
-
-            return hit_info(true,hit.col*shadow.shadow_factor,0.);
+            #if SHADOWS
+                vec3 shadow_intersect = ray.origin + ray.dir * (d*BRICK_SIZE+hit.d);
+                shadow_intersect += light_dir * 0.001f;
+                //shadow_intersect = 0.5*(floor(shadow_intersect)+ceil(shadow_intersect));
+                //hit_info shadow = trace_brickmap_shadows(shadow_intersect,light_dir);
+                shadow_info shadow = trace_brickmap_shadows(shadow_intersect, light_dir);
+                return hit_info(true,hit.col*shadow.shadow_factor,0.);
+            #else 
+                return hit_info(true,hit.col,0.);
+            #endif
         }
         
         norm = vec3(lessThanEqual(sideDist.xyz, min(sideDist.yzx, sideDist.zxy)));
@@ -435,7 +441,8 @@ struct collision_info {
 };
 
 bool check_corner(in ivec3 origin, in ivec3 corner, out vec3 offset) {
-    if(get_voxels(ivec3(corner),0).hit) {
+    hit_info h = get_voxels(corner,0u);
+    if(h.hit) {
         offset = normalize(vec3(origin-corner))*0.001;
         offset.y += 0.001;
         return true;
@@ -443,7 +450,7 @@ bool check_corner(in ivec3 origin, in ivec3 corner, out vec3 offset) {
 
     return false;
 }
-/*
+
 collision_info aabb_intersect(vec3 origin_f) {
     collision_info info;
     info.is_on_ground = false;
@@ -482,7 +489,9 @@ collision_info aabb_intersect(vec3 origin_f) {
     info.offset = offset;
     
     return info;
-}*/
+}
+
+ivec3 previous_hit_pos = ivec3(0);
 
 void main() {
     ivec2 img_coord = ivec2(gl_GlobalInvocationID.x,gl_GlobalInvocationID.y);
@@ -510,32 +519,32 @@ void main() {
     cast_to_voxel(front_ray, hit_pos, hit_pos_norm);
     
     ivec3 hit_pos_c = ivec3(hit_pos.x,hit_pos.z,hit_pos.y);
+    
 
     bool place_state = (glob.player_flags & (1u << 1)) != 0u;
     bool break_state = (glob.player_flags & (1u << 0)) != 0u;
-    
-    //bool is_colliding = false;
-    //bool is_on_ground = false;
-    //bool is_ceiling_low = false;
-    //vec3 collision_offset = vec3(0.);
 
-    //collision_info info = aabb_intersect(ray_origin);
-    //collision_offset = info.offset;
-    //gpu_out.collision_offset = collision_offset;
+    collision_info info = aabb_intersect(ray_origin);
+    gpu_out.collision_offset = info.offset;
+
+    bool is_colliding = false;
+    bool is_on_ground = false;
+    bool is_ceiling_low = false;
     
     if (gl_GlobalInvocationID.x == 0 && gl_GlobalInvocationID.y == 0 && gl_GlobalInvocationID.z == 0) {
-        //bool is_colliding = info.is_colliding;
-        //bool is_on_ground = info.is_on_ground;
-        //bool is_ceiling_low = info.is_ceiling_low;
+        bool is_colliding = info.is_colliding;
+        bool is_on_ground = info.is_on_ground;
+        bool is_ceiling_low = info.is_ceiling_low;
 
-        //gpu_out.collision_flags = 
-        //    (uint(is_colliding) << 0) |
-        //    (uint(is_on_ground) << 1) |
-        //    (uint(is_ceiling_low) << 2);
+        gpu_out.collision_flags = 
+            (uint(is_colliding) << 0) |
+            (uint(is_on_ground) << 1) |
+            (uint(is_ceiling_low) << 2);
         
         ivec3 voxel_pos = ivec3(0);
         int size = 3;
-        if (break_state || place_state) {
+        if ((break_state || place_state) && (hit_pos_c != previous_hit_pos)) {
+            previous_hit_pos = hit_pos_c;
             for (int x = -size; x <= size; x++) {
                 for (int y = -size; y <= size; y++) {
                     for (int z = -size; z <= size; z++) {

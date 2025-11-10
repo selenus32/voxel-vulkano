@@ -9,6 +9,7 @@ void main() {
     vec2 uv = vec2(img_coord-0.5) / imageSize(img).xy;
 
     mat4 proj = glob.proj;
+    gpu_out.collision_offset = vec3(0.);
     uint value = brickmap.data[0];
     vec4 pixel = vec4(0.);
 
