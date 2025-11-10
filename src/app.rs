@@ -87,9 +87,7 @@ use na::{
 };
 
 use crate::player::Player;
-
-use crate::voxels::brickmap::*;
-//use crate::voxels::tree64;
+use crate::voxels::voxels::*;
 
 #[derive(Hash, Eq, PartialEq, Debug)]
 enum InputButton {
@@ -323,9 +321,9 @@ impl App {
 
     fn upload_brickmap(&mut self) {
         //let gpu_brickmap = generate_brickmap().bytes;
-        let gpu_brickmap = read_voxel_model("assets/haunted_house.vox");
+        let gpu_bytes = read_voxel_model("assets/disney.vox");
         //let gpu_brickmap = read_voxel_model("assets/nuke.brk");
-        self.brickmap_data_size = (gpu_brickmap.bytes.len() / std::mem::size_of::<u32>()) as u32;
+        self.brickmap_data_size = (gpu_bytes.len() / std::mem::size_of::<u32>()) as u32;
 
         let temporary_accessible_buffer = Buffer::from_iter(
             self.memory_allocator.as_ref().unwrap().clone(),
@@ -338,7 +336,7 @@ impl App {
                     | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
                 ..Default::default()
             },
-            gpu_brickmap.bytes,
+            gpu_bytes,
         )
         .unwrap();
 
