@@ -17,8 +17,24 @@ pub struct GPUBrickMap {
     pub bytes: Vec<u8>,
 }
 
+// edited from user https://github.com/entropylost
+fn to_transform(position: IVec3, rotation: dot_vox::Rotation, size: UVec3) -> (Vec3, Mat3) {
+    let position = position.as_vec3();
+
+    let rotation = Mat3::from_cols_array_2d(&rotation.to_cols_array_2d());
+
+    let mut offset = Vec3::select(
+        (size % 2).cmpeq(UVec3::ZERO),
+        Vec3::ZERO,
+        Vec3::splat(0.5),
+    );
+    offset = rotation.mul_vec3(offset); // If another seam shows up in the future, try multiplying this with `scale`
+    let center = rotation * (size.as_vec3() / 2.0);
+    ((position - center + offset).into(), rotation.into())
+}
+
 // taken from dot_vox/examples/traverse_graph.rs
-fn iterate_vox_tree(vox_tree: &DotVoxData, mut fun: impl FnMut(&Model, &Vec3, &Rotation)) {
+fn iterate_vox_tree(vox_tree: &DotVoxData, mut fun: impl FnMut(&Model, &IVec3, &Mat3)) {
     match &vox_tree.scenes[0] {
         SceneNode::Transform {
             attributes: _,
@@ -29,24 +45,24 @@ fn iterate_vox_tree(vox_tree: &DotVoxData, mut fun: impl FnMut(&Model, &Vec3, &R
             iterate_vox_tree_inner(
                 vox_tree,
                 *child,
-                Vec3::new(0.0, 0.0, 0.0),
+                IVec3::new(0, 0, 0),
                 Rotation::IDENTITY,
                 &mut fun,
             );
         }
         _ => {
-            panic!("The root node for a magicka voxel DAG should be a Transform node")
+            panic!("The root node for a magicavoxel DAG should be a Transform node")
         }
     }
 }
 
-// taken from dot_vox/examples/traverse_graph.rs
+// edited from dot_vox/examples/traverse_graph.rs
 fn iterate_vox_tree_inner(
     vox_tree: &DotVoxData,
     current_node: u32,
-    translation: Vec3,
+    translation: IVec3,
     rotation: Rotation,
-    fun: &mut impl FnMut(&Model, &Vec3, &Rotation),
+    fun: &mut impl FnMut(&Model, &IVec3, &Mat3),
 ) {
     match &vox_tree.scenes[current_node as usize] {
         SceneNode::Transform {
@@ -64,20 +80,18 @@ fn iterate_vox_tree_inner(
                     .collect::<Vec<i32>>();
                 debug_assert_eq!(translation_delta.len(), 3);
                 translation
-                    + Vec3::new(
-                        translation_delta[0] as f32,
-                        translation_delta[1] as f32,
-                        translation_delta[2] as f32,
+                    + IVec3::new(
+                        translation_delta[0],
+                        translation_delta[1],
+                        translation_delta[2],
                     )
             } else {
                 translation
             };
             let rotation = if let Some(r) = frames[0].attributes.get("_r") {
-                rotation
-                    * Rotation::from_byte(
-                        r.parse()
-                            .expect("Expected valid u8 byte to parse rotation matrix"),
-                    )
+                rotation * Rotation::from_byte(
+                    r.parse().expect("Expected valid u8 byte to parse rotation matrix"),
+                )
             } else {
                 Rotation::IDENTITY
             };
@@ -101,10 +115,13 @@ fn iterate_vox_tree_inner(
             // in case the current node is a shape: it's a leaf node and it contains
             // models(voxel arrays)
             for model in models {
+                let model_size = vox_tree.models[model.model_id as usize].size;
+                let (model_translation, model_rotation) = 
+                    to_transform(translation, rotation, UVec3::new(model_size.x, model_size.y, model_size.z));
                 fun(
                     &vox_tree.models[model.model_id as usize],
-                    &translation,
-                    &rotation,
+                    &model_translation.as_ivec3(),
+                    &model_rotation,
                 );
             }
         }
@@ -132,83 +149,107 @@ pub fn parse_vox_to_brk(data: &DotVoxData) -> GPUBrickMap {
     }
 
     // taken from dot_vox/examples/traverse_graph.rs
-    let mut min_extent = Vec3::splat(f32::MAX);
-    let mut max_extent = Vec3::splat(f32::MIN);
+    let mut min_extent = IVec3::splat(i32::MAX);
+    let mut max_extent = IVec3::splat(i32::MIN);
 
-    iterate_vox_tree(data, |model, position, _orientation| {
-        let model_size = Vec3::new(model.size.x as f32, model.size.y as f32, model.size.z as f32);
-        let half_size = model_size / 2.0;
+    iterate_vox_tree(data, |model, translation, orientation| {
+        let extent = IVec3::new(
+            model.size.x as i32,
+            model.size.y as i32,
+            model.size.z as i32
+        );
 
-        let model_min = *position - half_size;
-        let model_max = *position + half_size;
+        let corners = [
+            IVec3::new(0, 0, 0),
+            IVec3::new(extent.x, 0, 0),
+            IVec3::new(0, extent.y, 0),
+            IVec3::new(0, 0, extent.z),
+            IVec3::new(extent.x, extent.y, 0),
+            IVec3::new(extent.x, 0, extent.z),
+            IVec3::new(0, extent.y, extent.z),
+            extent,
+        ];
 
-        min_extent = min_extent.min(model_min);
-        max_extent = max_extent.max(model_max);
-    });
+        for corner in corners {
+            let rotated_corner = orientation.mul_vec3(corner.as_vec3());
+            let world_corner = *translation + rotated_corner.as_ivec3();
 
-    let total_extent_f = max_extent - min_extent;
-    let bricks_extent_x = ((total_extent_f.x).ceil() as usize + BRICK_SIZE - 1) / BRICK_SIZE;
-    let bricks_extent_y = ((total_extent_f.y).ceil() as usize + BRICK_SIZE - 1) / BRICK_SIZE;
-    let bricks_extent_z = ((total_extent_f.z).ceil() as usize + BRICK_SIZE - 1) / BRICK_SIZE;
-
-
-    let mut bricks: Vec<Brick> =
-        vec![Brick { data: [0; BRICK_VOL] }; (bricks_extent_x * bricks_extent_y * bricks_extent_z) as usize];
-
-    // iterate through .vox scene models and their voxels
-    // store voxel colours in each brick
-    let min_extent_u = min_extent.floor().as_uvec3();
-    iterate_vox_tree(data, |model, position, orientation| {
-        let model_center = *position;
-        let mat = orientation.to_cols_array_2d();
-
-        for voxel in &model.voxels {
-            let colour = &data.palette[voxel.i as usize];
-            if colour.a == 0 { continue; }
-
-            let voxel_value: u32 = ((colour.r as u32) << 24)
-                | ((colour.g as u32) << 16)
-                | ((colour.b as u32) << 8)
-                | ((colour.a as u32) << 0);
-
-            let local_voxel = Vec3::new(voxel.x as f32, voxel.y as f32, voxel.z as f32);
-
-            let rotated_voxel = Vec3::new(
-                mat[0][0] * local_voxel.x + mat[0][1] * local_voxel.y + mat[0][2] * local_voxel.z,
-                mat[1][0] * local_voxel.x + mat[1][1] * local_voxel.y + mat[1][2] * local_voxel.z,
-                mat[2][0] * local_voxel.x + mat[2][1] * local_voxel.y + mat[2][2] * local_voxel.z,
-            );
-
-            let voxel_pos_f = model_center + rotated_voxel - min_extent;
-            let voxel_pos = voxel_pos_f.floor().as_uvec3();
-
-            let brick_i = voxel_pos / BRICK_SIZE as u32;
-            let in_brick_i = voxel_pos % BRICK_SIZE as u32;
-
-            let brick_index = brick_i.x as usize
-                + brick_i.y as usize * bricks_extent_x
-                + brick_i.z as usize * bricks_extent_x * bricks_extent_y;
-
-            let in_brick_index = in_brick_i.x as usize
-                + in_brick_i.y as usize * BRICK_SIZE
-                + in_brick_i.z as usize * BRICK_SIZE * BRICK_SIZE;
-
-            bricks[brick_index].data[in_brick_index] = voxel_value;
+            min_extent = min_extent.min(world_corner);
+            max_extent = max_extent.max(world_corner);
         }
     });
+
+    let total_extent = UVec3::new(
+        (max_extent.x - min_extent.x) as u32,
+        (max_extent.y - min_extent.y) as u32,
+        (max_extent.z - min_extent.z) as u32
+    );
+
+    let bricks_extent_x = ((total_extent.x) + BRICK_SIZE as u32 - 1) / BRICK_SIZE as u32; // ceiling
+    let bricks_extent_y = ((total_extent.y) + BRICK_SIZE as u32 - 1) / BRICK_SIZE as u32;
+    let bricks_extent_z = ((total_extent.z) + BRICK_SIZE as u32 - 1) / BRICK_SIZE as u32;
+    
+    let total_bricks = bricks_extent_x
+        .saturating_mul(bricks_extent_y)
+        .saturating_mul(bricks_extent_z) as u32;
+
+    println!("min_extent: {}", min_extent);
+    println!("max_extent: {}", max_extent);
+    println!("total_extent (size): {}", total_extent);
+    println!("bricks: {} x {} x {}", bricks_extent_x, bricks_extent_y, bricks_extent_z);
+
+    let mut bricks: Vec<Brick> =
+        vec![Brick { data: [0; BRICK_VOL] }; total_bricks as usize];
 
     let mut bytes = Vec::new();
     let magic = u32::from_ne_bytes(*b"brk\0");
     bytes.extend(&magic.to_ne_bytes());
 
     let position: [u32; 3] = [0, 0, 0];
-    let total_extent: [u32; 3] = [
-        bricks_extent_x as u32 * BRICK_SIZE as u32,
-        bricks_extent_y as u32 * BRICK_SIZE as u32,
-        bricks_extent_z as u32 * BRICK_SIZE as u32,
-    ];
     bytes.extend(bytemuck::cast_slice(&position));
-    bytes.extend(bytemuck::cast_slice(&total_extent));
+
+    bytes.extend_from_slice(&total_extent.x.to_ne_bytes());
+    bytes.extend_from_slice(&total_extent.y.to_ne_bytes());
+    bytes.extend_from_slice(&total_extent.z.to_ne_bytes());
+
+    // iterate through .vox scene models and their voxels
+    // store voxel colours in each brick
+    iterate_vox_tree(data, |model, translation, orientation| {
+        for voxel in &model.voxels {
+            let colour = &data.palette[voxel.i as usize];
+            if colour.a == 0 { 
+                continue; 
+            }
+
+            let voxel_value: u32 = ((colour.r as u32) << 24)
+                | ((colour.g as u32) << 16)
+                | ((colour.b as u32) << 8)
+                | ((colour.a as u32) << 0);
+
+            let local_voxel = IVec3::new(voxel.x as i32, voxel.y as i32, voxel.z as i32);
+
+            let rotated_voxel = orientation.mul_vec3(local_voxel.as_vec3());
+
+            let voxel_pos_i = *translation + rotated_voxel.as_ivec3() - min_extent;
+
+            let b = (Vec3::new(voxel_pos_i.x as f32, voxel_pos_i.y as f32, voxel_pos_i.z as f32).floor() / BRICK_SIZE as f32).as_ivec3();
+            let brick_i = b.as_uvec3();
+
+            let in_brick_i = (voxel_pos_i - b * BRICK_SIZE as i32).as_uvec3();
+            
+            let brick_index = brick_i.x as usize
+                + brick_i.y as usize * bricks_extent_x as usize
+                + brick_i.z as usize * bricks_extent_x as usize * bricks_extent_y as usize;
+
+            let in_brick_index = in_brick_i.x as usize
+                + in_brick_i.y as usize * BRICK_SIZE
+                + in_brick_i.z as usize * BRICK_SIZE * BRICK_SIZE;
+
+            if brick_index < bricks.len() {
+                bricks[brick_index].data[in_brick_index] = voxel_value;
+            }
+        }
+    });
 
     let mut indices: Vec<u32> = vec![0; bricks.len()];
     for i in 0..bricks.len() {
